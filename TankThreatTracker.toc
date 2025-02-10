@@ -1,0 +1,7 @@
+## Interface: 11403 (Classic Hardcore WoW client version)
+## Title: Tank Threat Tracker
+## Notes: Tracks threat levels for all mobs you're in combat with.
+## Author: Trillium
+## Version: 1.0
+
+TankThreatTracker.lua
