@@ -374,7 +374,7 @@ local function UpdateThreatData()
         totalHeight = totalHeight + 20
     end
     
-    -- Then display other units
+    -- Then display other units with highest threat player
     for guid, data in pairs(threatCache) do
         -- Skip the 100% threat unit we already displayed
         if IsValidCombatUnit(guid) and (not hundredPercentUnit or data ~= hundredPercentUnit) then
@@ -392,7 +392,28 @@ local function UpdateThreatData()
             mobText:SetPoint("TOPLEFT", contentFrame, "TOPLEFT", 8, -(6 + (20 * (index - 1))))
             mobText:SetWidth(300)
             
-            -- Color and text logic remains the same...
+            -- Get highest threat player for this unit
+            local highestPlayer = nil
+            local playerCount = IsInRaid() and GetNumGroupMembers() or GetNumSubgroupMembers()
+            local prefix = IsInRaid() and "raid" or "party"
+            
+            -- Check player first
+            local _, _, playerThreat = UnitDetailedThreatSituation("player", "target")
+            if playerThreat then
+                highestPlayer = UnitName("player")
+            end
+            
+            -- Check all group members
+            for i = 1, playerCount do
+                local unitID = prefix..i
+                local _, _, threatPercent = UnitDetailedThreatSituation(unitID, "target")
+                if threatPercent and (not highestPlayer or threatPercent > playerThreat) then
+                    highestPlayer = UnitName(unitID)
+                    playerThreat = threatPercent
+                end
+            end
+            
+            -- Color and text logic
             local color = {1, 1, 1} -- default white
             if data.status == 3 then
                 color = {1, 0.1, 0.1} -- red (tanking)
@@ -402,7 +423,13 @@ local function UpdateThreatData()
                 color = {1, 1, 0.5} -- yellow (getting there)
             end
             
-            local text = string.format("%s: %.1f%%", data.name, data.threatPct)
+            local text
+            if highestPlayer and highestPlayer ~= UnitName("player") then
+                text = string.format("%s: %.1f%% (Top: %s)", data.name, data.threatPct, highestPlayer)
+            else
+                text = string.format("%s: %.1f%%", data.name, data.threatPct)
+            end
+            
             mobText:SetText(text)
             mobText:SetTextColor(unpack(color))
             mobText:Show()
@@ -410,6 +437,8 @@ local function UpdateThreatData()
             totalHeight = totalHeight + 20  -- Add height for each entry
         end
     end
+    
+    -- Rest of the function remains the same...
     
     -- Add final padding
     totalHeight = totalHeight + 6
