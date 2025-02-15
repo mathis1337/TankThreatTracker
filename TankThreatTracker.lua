@@ -6,7 +6,11 @@ TankThreatTracker:SetMovable(true)
 TankThreatTracker:EnableMouse(true)
 TankThreatTracker:RegisterForDrag("LeftButton")
 TankThreatTracker:SetScript("OnDragStart", TankThreatTracker.StartMoving)
-TankThreatTracker:SetScript("OnDragStop", TankThreatTracker.StopMovingOrSizing)
+TankThreatTracker:SetScript("OnDragStop", function(self)
+    self:StopMovingOrSizing()
+    -- Store all position information
+    self.savedPosition = {self:GetPoint()}
+end)
 
 -- Settings DB (saved between sessions)
 TankThreatTrackerDB = TankThreatTrackerDB or {
@@ -19,13 +23,40 @@ local mobNames = {}
 local lastCombatTime = {}
 local mobThreatTable = {}
 local lastThreatData = {}
+local activeUnits = {}
+local threatCache = {}
+local THREAT_CACHE_TIMEOUT = 5.0
+local COMBAT_CHECK_INTERVAL = 0.2
+local lastCombatCheck = 0
+local THREAT_UNIT_TIMEOUT = 10  -- Keep units in the threat window for 10 seconds after last seen
+local trackedUnits = {}
 
--- Add a clean semi-transparent background
-local bg = TankThreatTracker:CreateTexture(nil, "BACKGROUND")
-bg:SetAllPoints(TankThreatTracker)
+-- Create fixed-size header frame
+local header = CreateFrame("Frame", nil, TankThreatTracker)
+header:SetHeight(24)
+header:SetPoint("TOP", TankThreatTracker, "TOP", 0, 0)
+header:SetPoint("LEFT", TankThreatTracker, "LEFT", 0, 0)
+header:SetPoint("RIGHT", TankThreatTracker, "RIGHT", 0, 0)
+header:EnableMouse(true)
+header:RegisterForDrag("LeftButton")
+
+-- Create content frame that will expand
+local contentFrame = CreateFrame("Frame", nil, TankThreatTracker)
+contentFrame:SetPoint("TOP", header, "BOTTOM", 0, 0)
+contentFrame:SetPoint("LEFT", TankThreatTracker, "LEFT", 0, 0)
+contentFrame:SetPoint("RIGHT", TankThreatTracker, "RIGHT", 0, 0)
+contentFrame:SetHeight(26)  -- Initial minimum height
+
+-- Add backgrounds
+local bg = contentFrame:CreateTexture(nil, "BACKGROUND")
+bg:SetAllPoints(contentFrame)
 bg:SetColorTexture(0, 0, 0, 0.35)
 
--- Create a thin border using a single pixel texture
+local headerBg = header:CreateTexture(nil, "BACKGROUND")
+headerBg:SetAllPoints(header)
+headerBg:SetColorTexture(0, 0, 0, 0.7)
+
+-- Create border function
 local function CreateBorderLine(parent, edge, size, r, g, b, a)
     local line = parent:CreateTexture(nil, "BORDER")
     line:SetColorTexture(r or 0, g or 0, b or 0, a or 0.8)
@@ -50,11 +81,13 @@ local function CreateBorderLine(parent, edge, size, r, g, b, a)
     return line
 end
 
--- Add subtle borders
-CreateBorderLine(TankThreatTracker, "TOP")
-CreateBorderLine(TankThreatTracker, "BOTTOM")
-CreateBorderLine(TankThreatTracker, "LEFT")
-CreateBorderLine(TankThreatTracker, "RIGHT")
+-- Add borders to both frames
+CreateBorderLine(header, "TOP")
+CreateBorderLine(header, "LEFT")
+CreateBorderLine(header, "RIGHT")
+CreateBorderLine(contentFrame, "BOTTOM")
+CreateBorderLine(contentFrame, "LEFT")
+CreateBorderLine(contentFrame, "RIGHT")
 
 -- Create the dropdown frame
 local dropDown = CreateFrame("Frame", "TankThreatTrackerDropDown", UIParent, "UIDropDownMenuTemplate")
@@ -72,12 +105,14 @@ local function InitializeDropDown(frame, level, menuList)
     UIDropDownMenu_AddButton(info)
 end
 
--- Create Header Container (for click handling)
-local header = CreateFrame("Frame", nil, TankThreatTracker)
-header:SetHeight(20)
-header:SetPoint("TOPLEFT", TankThreatTracker, "TOPLEFT", 0, 0)
-header:SetPoint("TOPRIGHT", TankThreatTracker, "TOPRIGHT", 0, 0)
-header:EnableMouse(true)
+-- Set up header scripts
+header:SetScript("OnDragStart", function(self)
+    TankThreatTracker:StartMoving()
+end)
+
+header:SetScript("OnDragStop", function(self)
+    TankThreatTracker:StopMovingOrSizing()
+end)
 
 header:SetScript("OnMouseUp", function(self, button)
     if button == "RightButton" then
@@ -86,104 +121,45 @@ header:SetScript("OnMouseUp", function(self, button)
     end
 end)
 
--- Add a title to the frame
+-- Add title to header
 local title = header:CreateFontString(nil, "OVERLAY", "GameFontNormal")
 title:SetPoint("TOPLEFT", header, "TOPLEFT", 8, -6)
 title:SetText("Threat Watcher")
 title:SetTextColor(1, 1, 1, 1)
 
--- Function to clean up old combat entries
-local function CleanupCombatUnits()
-    -- Only clean up if we're in combat
-    if not UnitAffectingCombat("player") then
-        return
-    end
-
-    -- Check each unit
-    for guid, _ in pairs(activeCombatUnits) do
-        local found = false
-        
-        -- Check if unit exists in any form
-        local function CheckUnit(unit)
-            if UnitExists(unit) and UnitGUID(unit) == guid then
-                if not UnitIsDead(unit) then
-                    found = true
-                    return true
-                end
-            end
-            return false
-        end
-        
-        -- Check all possible unit references
-        if CheckUnit("target") then
-            -- Unit found, do nothing
-        elseif CheckUnit("targettarget") then
-            -- Unit found, do nothing
-        elseif CheckUnit("focus") then
-            -- Unit found, do nothing
-        elseif CheckUnit("focustarget") then
-            -- Unit found, do nothing
-        else
-            -- Check nameplates
-            local nameplateFound = false
-            for i = 1, 40 do
-                if CheckUnit("nameplate"..i) then
-                    nameplateFound = true
-                    break
-                end
-            end
-            
-            -- If not found in nameplates, check party/raid targets
-            if not nameplateFound and not found and IsInGroup() then
-                local prefix = IsInRaid() and "raid" or "party"
-                local count = IsInRaid() and GetNumGroupMembers() or GetNumSubgroupMembers()
-                for i = 1, count do
-                    if CheckUnit(prefix..i.."target") then
-                        break
-                    end
-                end
-            end
-        end
-        
-        -- Only remove if unit is actually dead or not found
-        if not found then
-            activeCombatUnits[guid] = nil
-            lastCombatTime[guid] = nil
-            mobNames[guid] = nil
-        end
-    end
+local function UpdateFrameSize(width, height)
+    local point, relativeTo, relativePoint, x, y = TankThreatTracker:GetPoint()
+    
+    -- Preserve the original anchoring method
+    TankThreatTracker:ClearAllPoints()
+    TankThreatTracker:SetSize(width, height)
+    TankThreatTracker:SetPoint(point, relativeTo, relativePoint, x, y)
 end
 
--- Helper function to find unit by GUID
-local function FindUnitByGUID(guid)
-    -- Check target
-    if UnitExists("target") and UnitGUID("target") == guid then
-        return "target"
+local function ResetTankThreatTrackerPosition()
+    TankThreatTracker:ClearAllPoints()
+    TankThreatTracker:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
+    TankThreatTracker:SetSize(250, 50)
+    
+    -- Reset saved position
+    if TankThreatTracker.savedPosition then
+        TankThreatTracker.savedPosition = nil
     end
     
-    -- Check party/raid targets
-    if IsInGroup() then
-        local prefix = IsInRaid() and "raid" or "party"
-        local count = IsInRaid() and GetNumGroupMembers() or GetNumSubgroupMembers()
-        for i = 1, count do
-            local unit = prefix..i.."target"
-            if UnitExists(unit) and UnitGUID(unit) == guid then
-                return unit
-            end
-        end
+    -- Reset database position if it exists
+    if TankThreatTrackerDB and TankThreatTrackerDB.position then
+        TankThreatTrackerDB.position = nil
     end
     
-    return nil
+    print("Tank Threat Tracker position reset to center of screen")
 end
 
 -- Function to check if a unit is actually in combat with us
 local function IsActuallyInCombat(guid, unit)
-    -- Check if we've seen combat activity recently
     if lastCombatTime[guid] and (GetTime() - lastCombatTime[guid] < 5) then
         return true
     end
     
-    -- Check if the unit exists and is in combat
     if unit and UnitExists(unit) then
         return UnitAffectingCombat(unit) and UnitCanAttack("player", unit)
     end
@@ -191,125 +167,11 @@ local function IsActuallyInCombat(guid, unit)
     return false
 end
 
--- First, add a function to get threat info for all group members
-local function GetGroupThreatInfo(unit)
-    local highestThreat = 0
-    local highestPlayer = nil
-    local playerCount = IsInRaid() and GetNumGroupMembers() or GetNumSubgroupMembers()
-    local prefix = IsInRaid() and "raid" or "party"
-    
-    -- Check player first
-    local _, _, playerThreat = UnitDetailedThreatSituation("player", unit)
-    if playerThreat then
-        highestThreat = playerThreat
-        highestPlayer = UnitName("player")
-    end
-    
-    -- Check all group members
-    for i = 1, playerCount do
-        local unitID = prefix..i
-        local _, _, threatPercent = UnitDetailedThreatSituation(unitID, unit)
-        if threatPercent and threatPercent > highestThreat then
-            highestThreat = threatPercent
-            highestPlayer = UnitName(unitID)
-        end
-    end
-    
-    -- Also check player's pet if exists
-    if UnitExists("pet") then
-        local _, _, petThreat = UnitDetailedThreatSituation("pet", unit)
-        if petThreat and petThreat > highestThreat then
-            highestThreat = petThreat
-            highestPlayer = UnitName("pet").." (Pet)"
-        end
-    end
-    
-    return highestPlayer, highestThreat
-end
-
--- Function to check if we have valid threat data for a GUID
-local function GetThreatInfoByGUID(guid)
-    local function GetCurrentThreatData(unit)
-        if UnitExists(unit) then
-            local isTanking, status, threatPercent = UnitDetailedThreatSituation("player", unit)
-            if threatPercent then
-                -- Get highest threat info before caching
-                local highestThreatPlayer, highestThreatPercent = GetGroupThreatInfo(unit)
-                
-                -- Cache all the data
-                lastThreatData[guid] = {
-                    isTanking = isTanking,
-                    status = status,
-                    threatPercent = threatPercent,
-                    highestThreatPlayer = highestThreatPlayer,
-                    highestThreatPercent = highestThreatPercent,
-                    time = GetTime()
-                }
-                return isTanking, status, threatPercent, unit, highestThreatPlayer, highestThreatPercent
-            end
-        end
-        return nil
-    end
-
-    -- Try to get current data from nameplates first
-    for i = 1, 40 do
-        local unit = "nameplate"..i
-        if UnitExists(unit) and UnitGUID(unit) == guid then
-            local result = {GetCurrentThreatData(unit)}
-            if result[1] then 
-                return unpack(result)
-            end
-        end
-    end
-    
-    -- Check target and other direct references
-    local unitTypes = {"target", "targettarget", "focus", "focustarget"}
-    for _, unit in ipairs(unitTypes) do
-        if UnitExists(unit) and UnitGUID(unit) == guid then
-            local result = {GetCurrentThreatData(unit)}
-            if result[1] then 
-                return unpack(result)
-            end
-        end
-    end
-    
-    -- Check group targets
-    if IsInGroup() then
-        local prefix = IsInRaid() and "raid" or "party"
-        local count = IsInRaid() and GetNumGroupMembers() or GetNumSubgroupMembers()
-        for i = 1, count do
-            local unit = prefix..i.."target"
-            if UnitExists(unit) and UnitGUID(unit) == guid then
-                local result = {GetCurrentThreatData(unit)}
-                if result[1] then 
-                    return unpack(result)
-                end
-            end
-        end
-    end
-    
-    -- If we couldn't get current data, use cached data if it's recent enough
-    if lastThreatData[guid] then
-        local cachedData = lastThreatData[guid]
-        if GetTime() - cachedData.time < 2 then  -- Use cached data for up to 2 seconds
-            return cachedData.isTanking, cachedData.status, cachedData.threatPercent, nil,
-                   cachedData.highestThreatPlayer, cachedData.highestThreatPercent
-        end
-    end
-    
-    return nil
-end
-
-
-
-
 -- Function to handle combat log events
 local function HandleCombatLogEvent(...)
     local timestamp, eventType, hideCaster, sourceGUID, sourceName, sourceFlags, sourceRaidFlags, destGUID, destName, destFlags, destRaidFlags = ...
     
-    -- Track any combat event
     if eventType:match("_DAMAGE") or eventType:match("_HEAL") or eventType:match("_AURA") or eventType:match("_THREAT") then
-        -- Function to track hostile units
         local function TrackUnit(guid, name, flags)
             if guid and name and bit.band(flags, COMBATLOG_OBJECT_REACTION_HOSTILE) > 0 then
                 activeCombatUnits[guid] = true
@@ -318,7 +180,6 @@ local function HandleCombatLogEvent(...)
             end
         end
         
-        -- Track source and destination
         if bit.band(sourceFlags or 0, COMBATLOG_OBJECT_TYPE_NPC) > 0 then
             TrackUnit(sourceGUID, sourceName, sourceFlags)
         end
@@ -328,24 +189,80 @@ local function HandleCombatLogEvent(...)
     end
 end
 
--- Function to handle visibility based on combat state
-function UpdateVisibility()
-    if TankThreatTrackerDB.hideOutOfCombat and not UnitAffectingCombat("player") then
-        TankThreatTracker:Hide()
-    else
-        TankThreatTracker:Show()
+-- Function to check if unit is valid for combat tracking
+local function IsValidCombatUnit(guid)
+    if not guid then return false end
+    
+    local currentTime = GetTime()
+    
+    -- Check if unit is in active threat cache
+    if threatCache[guid] and (currentTime - threatCache[guid].time) < THREAT_CACHE_TIMEOUT then
+        return true
     end
+    
+    -- Check tracked units with extended timeout
+    local trackedUnit = trackedUnits[guid]
+    if trackedUnit and (currentTime - trackedUnit.lastSeenTime) < THREAT_UNIT_TIMEOUT then
+        return true
+    end
+    
+    local function CheckUnit(unit)
+        if UnitExists(unit) and UnitGUID(unit) == guid then
+            return UnitAffectingCombat(unit) and UnitCanAttack("player", unit)
+        end
+        return false
+    end
+    
+    if CheckUnit("target") or CheckUnit("mouseover") then
+        return true
+    end
+    
+    for i = 1, 40 do
+        if CheckUnit("nameplate"..i) then
+            return true
+        end
+    end
+    
+    return false
+end
+
+-- Function to update threat cache
+local function UpdateThreatCache(guid, name, isTanking, status, threatPct)
+    if not threatCache[guid] then
+        threatCache[guid] = {}
+    end
+    
+    local currentTime = GetTime()
+    threatCache[guid] = {
+        name = name,
+        isTanking = isTanking,
+        status = status,
+        threatPct = threatPct,
+        time = currentTime,
+        lastCombatTime = currentTime
+    }
+    activeUnits[guid] = true
+    
+    -- Track when we last saw this unit
+    if not trackedUnits[guid] then
+        trackedUnits[guid] = {
+            firstSeenTime = currentTime,
+            name = name
+        }
+    end
+    trackedUnits[guid].lastSeenTime = currentTime
 end
 
 -- Function to scan for hostile units
 local function ScanForHostileUnits()
     local function CheckUnit(unit)
-        if UnitExists(unit) and 
-           UnitCanAttack("player", unit) and 
-           UnitAffectingCombat("player") then  -- Only check if we're in combat
+        if UnitExists(unit) then
+            local canAttack = UnitCanAttack("player", unit)
+            local inCombat = UnitAffectingCombat("player")
             local guid = UnitGUID(unit)
             local name = UnitName(unit)
-            if guid and name then
+            
+            if canAttack and inCombat and guid and name then
                 activeCombatUnits[guid] = true
                 mobNames[guid] = name
                 lastCombatTime[guid] = GetTime()
@@ -353,18 +270,15 @@ local function ScanForHostileUnits()
         end
     end
 
-    -- Check target and target of target
     CheckUnit("target")
     CheckUnit("targettarget")
     CheckUnit("focus")
     CheckUnit("focustarget")
     
-    -- Check nameplates (most reliable for multiple targets)
     for i = 1, 40 do
         CheckUnit("nameplate"..i)
     end
     
-    -- Check party/raid targets
     if IsInGroup() then
         local prefix = IsInRaid() and "raid" or "party"
         local count = IsInRaid() and GetNumGroupMembers() or GetNumSubgroupMembers()
@@ -374,103 +288,226 @@ local function ScanForHostileUnits()
     end
 end
 
--- UpdateThreatData function to include the highest threat info
+-- Modified UpdateThreatData function with new frame structure
 local function UpdateThreatData()
-    -- Only update if we're in combat
-    if not UnitAffectingCombat("player") then
-        return
+    if not UnitAffectingCombat("player") then 
+        -- When out of combat, clear units that are no longer relevant
+        local currentTime = GetTime()
+        for guid, unitInfo in pairs(trackedUnits) do
+            -- Only remove if the unit was not seen in combat for a long time
+            if (currentTime - unitInfo.lastSeenTime) >= 300 then  -- 5 minutes
+                trackedUnits[guid] = nil
+                threatCache[guid] = nil
+            end
+        end
+        
+        wipe(activeUnits)
+        return 
     end
-
-    -- Scan for any new hostile units
-    ScanForHostileUnits()
     
-    -- Clean up old combat entries first
-    CleanupCombatUnits()
-
+    local currentTime = GetTime()
+    
+    -- Update combat check timer
+    if currentTime - lastCombatCheck >= COMBAT_CHECK_INTERVAL then
+        lastCombatCheck = currentTime
+        
+        -- Process target
+        if UnitExists("target") and UnitCanAttack("player", "target") then
+            local guid = UnitGUID("target")
+            local name = UnitName("target")
+            local isTanking, status, threatPct = UnitDetailedThreatSituation("player", "target")
+            
+            if guid and name and threatPct then
+                UpdateThreatCache(guid, name, isTanking, status, threatPct)
+            end
+        end
+        
+        -- Process mouseover
+        if UnitExists("mouseover") and UnitCanAttack("player", "mouseover") then
+            local guid = UnitGUID("mouseover")
+            local name = UnitName("mouseover")
+            local isTanking, status, threatPct = UnitDetailedThreatSituation("player", "mouseover")
+            
+            if guid and name and threatPct then
+                UpdateThreatCache(guid, name, isTanking, status, threatPct)
+            end
+        end
+    end
+    
     -- Clear previous visual elements
     for i = 1, #mobThreatTable do
-        mobThreatTable[i]:Hide()
+        if mobThreatTable[i] then
+            mobThreatTable[i]:Hide()
+        end
     end
     wipe(mobThreatTable)
-
-    -- Process all known combat units
+    
+    -- Find unit with 100% threat (excluding player)
+    local hundredPercentUnit = nil
+    for guid, data in pairs(threatCache) do
+        if IsValidCombatUnit(guid) and data.threatPct == 100 and not UnitIsUnit(data.name, "player") then
+            hundredPercentUnit = data
+            break
+        end
+    end
+    
+    -- Display all active units
     local index = 0
-    for guid, _ in pairs(activeCombatUnits) do
-        -- Get threat data specifically for this unit
-        local isTanking, status, threatPercent, foundUnit, highestPlayer, highestPercent = GetThreatInfoByGUID(guid)
+    local totalHeight = 6  -- Start with padding
+    
+    -- Display 100% threat unit first if found
+    if hundredPercentUnit then
+        index = index + 1
         
-        if (threatPercent or (lastThreatData[guid] and GetTime() - lastThreatData[guid].time < 2)) and mobNames[guid] then
+        local mobText = contentFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+        table.insert(mobThreatTable, mobText)
+        
+        mobText:ClearAllPoints()
+        mobText:SetPoint("TOPLEFT", contentFrame, "TOPLEFT", 8, -(6 + (20 * (index - 1))))
+        mobText:SetWidth(300)
+        
+        local text = string.format("%s: 100%%", hundredPercentUnit.name)
+        mobText:SetText(text)
+        mobText:SetTextColor(1, 0.1, 0.1)  -- Red color for 100% threat
+        mobText:Show()
+        
+        totalHeight = totalHeight + 20
+    end
+    
+    -- Then display other units with highest threat player
+    for guid, data in pairs(threatCache) do
+        -- Skip the 100% threat unit we already displayed
+        if IsValidCombatUnit(guid) and (not hundredPercentUnit or data ~= hundredPercentUnit) then
             index = index + 1
             
-            -- If we don't have current threat data, use cached data
-            if not threatPercent and lastThreatData[guid] then
-                isTanking = lastThreatData[guid].isTanking
-                status = lastThreatData[guid].status
-                threatPercent = lastThreatData[guid].threatPercent
-                highestPlayer = lastThreatData[guid].highestThreatPlayer
-                highestPercent = lastThreatData[guid].highestThreatPercent
-            end
-            
-            -- Create or reuse a line for the mob
+            -- Ensure mobText is created
             local mobText = mobThreatTable[index]
             if not mobText then
-                mobText = TankThreatTracker:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-                mobText:SetPoint("TOPLEFT", TankThreatTracker, "TOPLEFT", 8, -(24 + (20 * (index - 1))))
-                mobText:SetWidth(300)
+                mobText = contentFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
                 table.insert(mobThreatTable, mobText)
             end
             
-            -- Color code based on threat situation
+            -- Position from top of content frame
+            mobText:ClearAllPoints()
+            mobText:SetPoint("TOPLEFT", contentFrame, "TOPLEFT", 8, -(6 + (20 * (index - 1))))
+            mobText:SetWidth(300)
+            
+            -- Get highest threat player for this unit
+            local highestPlayer = nil
+            local playerCount = IsInRaid() and GetNumGroupMembers() or GetNumSubgroupMembers()
+            local prefix = IsInRaid() and "raid" or "party"
+            
+            -- Check player first
+            local _, _, playerThreat = UnitDetailedThreatSituation("player", "target")
+            if playerThreat then
+                highestPlayer = UnitName("player")
+            end
+            
+            -- Check all group members
+            for i = 1, playerCount do
+                local unitID = prefix..i
+                local _, _, threatPercent = UnitDetailedThreatSituation(unitID, "target")
+                if threatPercent and (not highestPlayer or threatPercent > playerThreat) then
+                    highestPlayer = UnitName(unitID)
+                    playerThreat = threatPercent
+                end
+            end
+            
+            -- Color and text logic
             local color = {1, 1, 1} -- default white
-            if status == 3 then
+            if data.status == 3 then
                 color = {1, 0.1, 0.1} -- red (tanking)
-            elseif status == 2 then
+            elseif data.status == 2 then
                 color = {1, 0.5, 0.25} -- orange (about to pull)
-            elseif status == 1 then
+            elseif data.status == 1 then
                 color = {1, 1, 0.5} -- yellow (getting there)
             end
             
-            -- Format text with colored player name using WoW color codes
-            local text = string.format("%s: %.1f%% ", mobNames[guid], threatPercent or 0)
+            local text
             if highestPlayer and highestPlayer ~= UnitName("player") then
-                text = text .. string.format("(Top: |cffA335EE%s|r - %.1f%%)", highestPlayer, highestPercent)
+                text = string.format("%s: %.1f%% (Top: %s)", data.name, data.threatPct, highestPlayer)
+            else
+                text = string.format("%s: %.1f%%", data.name, data.threatPct)
             end
             
             mobText:SetText(text)
             mobText:SetTextColor(unpack(color))
             mobText:Show()
+            
+            totalHeight = totalHeight + 20  -- Add height for each entry
         end
     end
     
-    -- Adjust frame size based on content
-    local height = math.max(50, 30 + (index * 20))
+    -- Rest of the function remains the same...
+    
+    -- Add final padding
+    totalHeight = totalHeight + 6
+    
+    -- Calculate maximum width needed
     local maxWidth = 250
     for i = 1, #mobThreatTable do
-        if mobThreatTable[i]:IsShown() then
+        if mobThreatTable[i] and mobThreatTable[i]:IsShown() then
             local width = mobThreatTable[i]:GetStringWidth()
             maxWidth = math.max(maxWidth, width + 20)
         end
     end
     
-    TankThreatTracker:SetWidth(maxWidth)
-    TankThreatTracker:SetHeight(height)
+    -- Update content frame height
+    local contentHeight = math.max(26, totalHeight)
+    contentFrame:SetHeight(contentHeight)
     
-    if bg then
-        bg:SetAllPoints(TankThreatTracker)
+    -- Update main frame size 
+    local headerHeight = 24
+    local totalFrameHeight = headerHeight + contentHeight
+    
+    -- Preserve current positioning
+    local point, relativeTo, relativePoint, x, y = TankThreatTracker:GetPoint()
+    
+    -- Adjust y coordinate if necessary to maintain visual position
+    if point:find("TOP") then
+        -- If already top-anchored, keep the same point
+        TankThreatTracker:SetSize(maxWidth, totalFrameHeight)
+    else
+        -- If not top-anchored, we need to adjust the y coordinate
+        local currentHeight = TankThreatTracker:GetHeight()
+        y = y + (currentHeight - totalFrameHeight) / 2
+        
+        TankThreatTracker:ClearAllPoints()
+        TankThreatTracker:SetSize(maxWidth, totalFrameHeight)
+        TankThreatTracker:SetPoint(point, relativeTo, relativePoint, x, y)
     end
 end
 
--- Register events
-TankThreatTracker:RegisterEvent("PLAYER_TARGET_CHANGED")
-TankThreatTracker:RegisterEvent("UNIT_THREAT_LIST_UPDATE")
-TankThreatTracker:RegisterEvent("PLAYER_REGEN_ENABLED")
-TankThreatTracker:RegisterEvent("PLAYER_REGEN_DISABLED")
-TankThreatTracker:RegisterEvent("GROUP_ROSTER_UPDATE")
-TankThreatTracker:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
-TankThreatTracker:RegisterEvent("PLAYER_LOGIN")
+-- Visibility handling
+function UpdateVisibility()
+    if TankThreatTrackerDB.hideOutOfCombat and not UnitAffectingCombat("player") then
+        TankThreatTracker:Hide()
+    else
+        TankThreatTracker:Show()
+    end
+end
+
+local function HandleUnitRemoval(guid)
+    if trackedUnits[guid] then
+        trackedUnits[guid] = nil
+        threatCache[guid] = nil
+    end
+end
+
 
 -- Event handler
 TankThreatTracker:SetScript("OnEvent", function(self, event, ...)
+    if event == "COMBAT_LOG_EVENT_UNFILTERED" then
+        local _, eventType, _, sourceGUID, _, _, _, destGUID = CombatLogGetCurrentEventInfo()
+        
+        -- Handle enemy unit death or despawn
+        if eventType == "UNIT_DIED" or eventType == "PARTY_KILL" or eventType == "SPELL_INSTAKILL" then
+            HandleUnitRemoval(destGUID)
+        end
+        
+        HandleCombatLogEvent(CombatLogGetCurrentEventInfo())
+    end
+
     if event == "PLAYER_LOGIN" then
         TankThreatTrackerDB = TankThreatTrackerDB or {
             hideOutOfCombat = false,
@@ -497,14 +534,25 @@ TankThreatTracker:SetScript("OnEvent", function(self, event, ...)
         wipe(activeCombatUnits)
         wipe(mobNames)
         wipe(lastCombatTime)
-        wipe(lastThreatData)  -- Clear cached threat data
+        wipe(lastThreatData)
         UpdateVisibility()
     else
         UpdateThreatData()
     end
 end)
 
--- Slash command to toggle the window and handle out-of-combat visibility
+-- Register all necessary events
+TankThreatTracker:RegisterEvent("PLAYER_TARGET_CHANGED")
+TankThreatTracker:RegisterEvent("UPDATE_MOUSEOVER_UNIT")
+TankThreatTracker:RegisterEvent("UNIT_TARGET")
+TankThreatTracker:RegisterEvent("UNIT_THREAT_LIST_UPDATE")
+TankThreatTracker:RegisterEvent("PLAYER_REGEN_ENABLED")
+TankThreatTracker:RegisterEvent("PLAYER_REGEN_DISABLED")
+TankThreatTracker:RegisterEvent("GROUP_ROSTER_UPDATE")
+TankThreatTracker:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
+TankThreatTracker:RegisterEvent("PLAYER_LOGIN")
+
+-- Slash command
 SLASH_TANKTHREATTRACKER1 = "/ttt"
 SlashCmdList["TANKTHREATTRACKER"] = function(msg)
     msg = msg:lower()
@@ -512,6 +560,8 @@ SlashCmdList["TANKTHREATTRACKER"] = function(msg)
         TankThreatTrackerDB.hideOutOfCombat = not TankThreatTrackerDB.hideOutOfCombat
         print("Tank Threat Tracker: Out of combat hiding " .. (TankThreatTrackerDB.hideOutOfCombat and "enabled" or "disabled"))
         UpdateVisibility()
+    elseif msg == "reset" then
+        ResetTankThreatTrackerPosition()
     else
         if TankThreatTracker:IsShown() then
             TankThreatTracker:Hide()

@@ -2,6 +2,6 @@
 ## Title: Tank Threat Tracker
 ## Notes: Tracks threat levels for all mobs you're in combat with.
 ## Author: Trillium
-## Version: 1.0
+## Version: 1.1
 
 TankThreatTracker.lua
