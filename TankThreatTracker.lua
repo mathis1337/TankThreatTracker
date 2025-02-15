@@ -28,6 +28,8 @@ local threatCache = {}
 local THREAT_CACHE_TIMEOUT = 5.0
 local COMBAT_CHECK_INTERVAL = 0.2
 local lastCombatCheck = 0
+local THREAT_UNIT_TIMEOUT = 10  -- Keep units in the threat window for 10 seconds after last seen
+local trackedUnits = {}
 
 -- Create fixed-size header frame
 local header = CreateFrame("Frame", nil, TankThreatTracker)
@@ -191,7 +193,16 @@ end
 local function IsValidCombatUnit(guid)
     if not guid then return false end
     
-    if threatCache[guid] and (GetTime() - threatCache[guid].time) < THREAT_CACHE_TIMEOUT then
+    local currentTime = GetTime()
+    
+    -- Check if unit is in active threat cache
+    if threatCache[guid] and (currentTime - threatCache[guid].time) < THREAT_CACHE_TIMEOUT then
+        return true
+    end
+    
+    -- Check tracked units with extended timeout
+    local trackedUnit = trackedUnits[guid]
+    if trackedUnit and (currentTime - trackedUnit.lastSeenTime) < THREAT_UNIT_TIMEOUT then
         return true
     end
     
@@ -231,6 +242,15 @@ local function UpdateThreatCache(guid, name, isTanking, status, threatPct)
         lastCombatTime = currentTime
     }
     activeUnits[guid] = true
+    
+    -- Track when we last saw this unit
+    if not trackedUnits[guid] then
+        trackedUnits[guid] = {
+            firstSeenTime = currentTime,
+            name = name
+        }
+    end
+    trackedUnits[guid].lastSeenTime = currentTime
 end
 
 -- Function to scan for hostile units
@@ -271,8 +291,17 @@ end
 -- Modified UpdateThreatData function with new frame structure
 local function UpdateThreatData()
     if not UnitAffectingCombat("player") then 
+        -- When out of combat, clear units that are no longer relevant
+        local currentTime = GetTime()
+        for guid, unitInfo in pairs(trackedUnits) do
+            -- Only remove if the unit was not seen in combat for a long time
+            if (currentTime - unitInfo.lastSeenTime) >= 300 then  -- 5 minutes
+                trackedUnits[guid] = nil
+                threatCache[guid] = nil
+            end
+        end
+        
         wipe(activeUnits)
-        wipe(threatCache)
         return 
     end
     
@@ -313,12 +342,42 @@ local function UpdateThreatData()
     end
     wipe(mobThreatTable)
     
+    -- Find unit with 100% threat (excluding player)
+    local hundredPercentUnit = nil
+    for guid, data in pairs(threatCache) do
+        if IsValidCombatUnit(guid) and data.threatPct == 100 and not UnitIsUnit(data.name, "player") then
+            hundredPercentUnit = data
+            break
+        end
+    end
+    
     -- Display all active units
     local index = 0
     local totalHeight = 6  -- Start with padding
     
+    -- Display 100% threat unit first if found
+    if hundredPercentUnit then
+        index = index + 1
+        
+        local mobText = contentFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+        table.insert(mobThreatTable, mobText)
+        
+        mobText:ClearAllPoints()
+        mobText:SetPoint("TOPLEFT", contentFrame, "TOPLEFT", 8, -(6 + (20 * (index - 1))))
+        mobText:SetWidth(300)
+        
+        local text = string.format("%s: 100%%", hundredPercentUnit.name)
+        mobText:SetText(text)
+        mobText:SetTextColor(1, 0.1, 0.1)  -- Red color for 100% threat
+        mobText:Show()
+        
+        totalHeight = totalHeight + 20
+    end
+    
+    -- Then display other units
     for guid, data in pairs(threatCache) do
-        if IsValidCombatUnit(guid) then
+        -- Skip the 100% threat unit we already displayed
+        if IsValidCombatUnit(guid) and (not hundredPercentUnit or data ~= hundredPercentUnit) then
             index = index + 1
             
             -- Ensure mobText is created
@@ -399,10 +458,27 @@ function UpdateVisibility()
     end
 end
 
+local function HandleUnitRemoval(guid)
+    if trackedUnits[guid] then
+        trackedUnits[guid] = nil
+        threatCache[guid] = nil
+    end
+end
 
 
 -- Event handler
 TankThreatTracker:SetScript("OnEvent", function(self, event, ...)
+    if event == "COMBAT_LOG_EVENT_UNFILTERED" then
+        local _, eventType, _, sourceGUID, _, _, _, destGUID = CombatLogGetCurrentEventInfo()
+        
+        -- Handle enemy unit death or despawn
+        if eventType == "UNIT_DIED" or eventType == "PARTY_KILL" or eventType == "SPELL_INSTAKILL" then
+            HandleUnitRemoval(destGUID)
+        end
+        
+        HandleCombatLogEvent(CombatLogGetCurrentEventInfo())
+    end
+
     if event == "PLAYER_LOGIN" then
         TankThreatTrackerDB = TankThreatTrackerDB or {
             hideOutOfCombat = false,
